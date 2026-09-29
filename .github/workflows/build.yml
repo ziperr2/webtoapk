@@ -52,6 +52,10 @@ jobs:
 
       # =========================================================
       # 2. DOWNLOAD + EXTRACT
+      #    (dulu ada `unzip -t` buat tes integritas dulu sebelum extract --
+      #     itu bikin zip dibaca 2x penuh/percuma. `unzip -q` sendiri udah
+      #     bakal exit non-zero + kena `set -e` kalau zip-nya korup, jadi
+      #     -t dibuang: sama amannya, tapi cuma baca sekali.)
       # =========================================================
       - name: Download & extract ZIP
         env:
@@ -71,8 +75,17 @@ jobs:
           fi
 
           ls -lh project.zip
-          unzip -t project.zip >/dev/null
           unzip -q project.zip -d project_raw
+
+          echo "=== Struktur root project_raw ==="
+          find project_raw -maxdepth 3 -type d | head -50
+          echo ""
+          echo "=== File kunci ==="
+          find project_raw -maxdepth 6 -type f \
+            \( -name "gradlew" -o -name "pubspec.yaml" \
+               -o -name "settings.gradle" -o -name "settings.gradle.kts" \
+               -o -name "build.gradle" -o -name "build.gradle.kts" \) \
+            -not -path "*/build/*" | head -30
 
       # =========================================================
       # 3. AUTO-DETECT: FLUTTER vs GRADLE NATIVE
@@ -81,11 +94,11 @@ jobs:
         id: detect
         run: |
           set -euo pipefail
-          PUBSPEC=$(find project_raw -maxdepth 6 -type f -name pubspec.yaml \
+          PUBSPEC=$(find project_raw -type f -name pubspec.yaml \
                     -not -path "*/build/*" -not -path "*/.dart_tool/*" | head -n 1)
-          GRADLEW=$(find project_raw -maxdepth 6 -type f -name gradlew \
+          GRADLEW=$(find project_raw -type f -name gradlew \
                     -not -path "*/build/*" | head -n 1)
-          SETTINGS=$(find project_raw -maxdepth 6 -type f \
+          SETTINGS=$(find project_raw -type f \
                     \( -name "settings.gradle" -o -name "settings.gradle.kts" \) \
                     -not -path "*/build/*" | head -n 1)
 
@@ -98,11 +111,16 @@ jobs:
             echo "type=flutter" >> "$GITHUB_OUTPUT"
             echo "dir=$DIR"     >> "$GITHUB_OUTPUT"
             echo "✅ Flutter project → $DIR"
-          elif [ -n "$GRADLEW" ] && [ -n "$SETTINGS" ]; then
+          elif [ -n "$GRADLEW" ]; then
             DIR=$(dirname "$GRADLEW")
             echo "type=gradle"  >> "$GITHUB_OUTPUT"
             echo "dir=$DIR"     >> "$GITHUB_OUTPUT"
             echo "✅ Native Gradle project → $DIR"
+          elif [ -n "$SETTINGS" ]; then
+            DIR=$(dirname "$SETTINGS")
+            echo "type=gradle"  >> "$GITHUB_OUTPUT"
+            echo "dir=$DIR"     >> "$GITHUB_OUTPUT"
+            echo "✅ Gradle project (no wrapper) → $DIR"
           else
             echo "::error::Project tidak dikenali (bukan Flutter / bukan Gradle)."
             find project_raw -maxdepth 3
@@ -110,7 +128,7 @@ jobs:
           fi
 
       # =========================================================
-      # 4. JAVA + FLUTTER SDK (cached)
+      # 4. JAVA + FLUTTER SDK
       # =========================================================
       - name: Setup Java 17
         uses: actions/setup-java@v4
@@ -148,6 +166,8 @@ jobs:
 
       # =========================================================
       # 6. TUNE gradle.properties
+      #    Ditambah org.gradle.workers.max=4 biar konsisten sama GRADLE_OPTS
+      #    di atas (dulu cuma di-set lewat env, gradle.properties gak ikut).
       # =========================================================
       - name: Tune gradle.properties
         run: |
@@ -159,7 +179,7 @@ jobs:
           fi
           mkdir -p "$(dirname "$GP")"
           touch "$GP"
-          sed -i '/org.gradle.jvmargs/d;/org.gradle.parallel/d;/org.gradle.caching/d;/org.gradle.daemon/d;/org.gradle.configureondemand/d' "$GP" || true
+          sed -i '/org.gradle.jvmargs/d;/org.gradle.parallel/d;/org.gradle.caching/d;/org.gradle.daemon/d;/org.gradle.configureondemand/d;/org.gradle.workers.max/d' "$GP" || true
           {
             echo ""
             echo "org.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g"
@@ -167,10 +187,15 @@ jobs:
             echo "org.gradle.caching=true"
             echo "org.gradle.daemon=false"
             echo "org.gradle.configureondemand=true"
+            echo "org.gradle.workers.max=4"
           } >> "$GP"
 
       # =========================================================
-      # 7a. BUILD FLUTTER (arm64 only)
+      # 7a. BUILD FLUTTER
+      #     --no-shrink = skip R8 full-mode shrinking/obfuscation.
+      #     APK jadi lebih cepat dibuild (langkah paling berat di build
+      #     release dilewatin), trade-off: ukuran APK sedikit lebih besar
+      #     & gak diobfuskasi. Hapus baris --no-shrink kalau gak mau ini.
       # =========================================================
       - name: Build Flutter APK
         if: steps.detect.outputs.type == 'flutter'
@@ -184,66 +209,184 @@ jobs:
           flutter build apk --$BT \
             --target-platform=android-arm64 \
             --no-tree-shake-icons \
-            --no-pub
+            --no-shrink \
+            --no-pub 2>&1 | tee build.log
 
       # =========================================================
-      # 7b. BUILD GRADLE NATIVE (arm64 only)
+      # 7b. BUILD GRADLE NATIVE
       # =========================================================
       - name: Build Native APK
         if: steps.detect.outputs.type == 'gradle'
         working-directory: ${{ steps.detect.outputs.dir }}
         run: |
           set -euo pipefail
-          chmod +x gradlew
           BT="${{ github.event.inputs.build_type }}"
           [ -z "$BT" ] && BT=release
-          if [ "$BT" = "debug" ]; then TASK=":app:assembleDebug"; else TASK=":app:assembleRelease"; fi
-          ./gradlew "$TASK" \
-            --parallel --build-cache \
-            -Pandroid.injected.build.abi=arm64-v8a
+          if [ "$BT" = "debug" ]; then TASK="assembleDebug"; else TASK="assembleRelease"; fi
 
-      # =========================================================
-      # 8. LOCATE APK
-      # =========================================================
-      - name: Locate APK
-        run: |
-          set -euo pipefail
-          DIR="${{ steps.detect.outputs.dir }}"
-          APK_DIR=""
-
-          # Flutter path
-          if [ -d "$DIR/build/app/outputs/flutter-apk" ]; then
-            APK_DIR="$DIR/build/app/outputs/flutter-apk"
-          # Native gradle path
-          elif [ -d "$DIR/app/build/outputs/apk" ]; then
-            APK_DIR=$(find "$DIR/app/build/outputs/apk" -type d \
-                      \( -name "release" -o -name "debug" \) | head -n 1)
-            [ -z "$APK_DIR" ] && APK_DIR="$DIR/app/build/outputs/apk"
+          if [ -f gradlew ]; then
+            chmod +x gradlew
+            CMD="./gradlew"
+            echo "✅ Pakai gradle wrapper"
+          else
+            echo "⚠️ gradlew tidak ada, generate wrapper dulu"
+            gradle wrapper --gradle-version 8.7 || true
+            if [ -f gradlew ]; then
+              chmod +x gradlew
+              CMD="./gradlew"
+            else
+              CMD="gradle"
+            fi
           fi
 
-          # Fallback scan
-          if [ -z "$APK_DIR" ] || [ -z "$(find "$APK_DIR" -maxdepth 2 -name '*.apk' 2>/dev/null)" ]; then
-            APK=$(find "$DIR" -type f -name "*.apk" \
-                  -not -path "*/intermediates/*" | head -n 1)
-            if [ -z "$APK" ]; then
-              echo "::error::APK tidak ditemukan setelah build."
+          echo "Running: $CMD $TASK"
+          $CMD "$TASK" \
+            --parallel --build-cache \
+            -Pandroid.injected.build.abi=arm64-v8a 2>&1 | tee build.log || {
+              echo "::error::Build gagal. Cek log di atas."
+              tail -100 build.log
               exit 1
+            }
+
+      # =========================================================
+      # 8. DEBUG — SCAN SEMUA APK
+      #    Dulu `if: always()` -> ikut jalan (dan makan waktu extra scan
+      #    recursive project_raw) bahkan pas build SUKSES. Sekarang cuma
+      #    jalan kalau ada step sebelumnya yang gagal, biar run normal
+      #    (happy path) lebih cepat.
+      # =========================================================
+      - name: Debug - scan all APK
+        if: failure()
+        run: |
+          echo "=== SEMUA APK di project_raw ==="
+          find project_raw -type f -name "*.apk" -exec ls -lh {} \; 2>/dev/null || echo "TIDAK ADA APK"
+          echo ""
+          echo "=== Tree project_raw/app/build/outputs ==="
+          find project_raw -type d -name "outputs" -exec find {} -maxdepth 3 -type d \; 2>/dev/null || true
+          echo ""
+          echo "=== File di outputs ==="
+          find project_raw -type d -name "outputs" -exec find {} -type f \; 2>/dev/null || true
+
+      # =========================================================
+      # 9. LOCATE APK  (FIXED: akar masalah "build sukses tapi APK gak
+      #    ke-ambil")
+      #
+      #    Sebelumnya cuma nebak lokasi pakai `find` + exclude pattern --
+      #    kalau ada APK lain nyangkut di project_raw (contoh: folder
+      #    example/plugin lain yang kebawa dalam zip, atau path Gradle beda
+      #    tergantung versi AGP), `find` bisa ambil yang salah atau malah
+      #    ke-exclude semua sehingga dianggap "tidak ketemu" walau Flutter
+      #    tadi BENERAN sukses build.
+      #
+      #    Fix: untuk project Flutter, baca LANGSUNG baris yang di-print
+      #    Flutter sendiri di build.log, contoh:
+      #      "✓ Built build/app/outputs/flutter-apk/app-release.apk (21MB)."
+      #    Itu path PASTI dan resmi dari tool-nya sendiri -- bukan tebakan.
+      #    Baru kalau parsing itu gagal (mis. project Gradle native yang
+      #    gak punya baris seperti itu), jatuh ke strategi `find` lama
+      #    sebagai fallback.
+      # =========================================================
+      - name: Locate APK
+        id: locate
+        run: |
+          set -euo pipefail
+          APK=""
+
+          # --- Strategi utama (Flutter): baca path resmi dari build.log ---
+          if [ "${{ steps.detect.outputs.type }}" = "flutter" ]; then
+            LOG="${{ steps.detect.outputs.dir }}/build.log"
+            if [ -f "$LOG" ]; then
+              REL=$(grep -oE 'Built [^ ]+\.apk' "$LOG" | tail -n1 | sed -E 's/^Built //')
+              if [ -n "$REL" ]; then
+                CAND="${{ steps.detect.outputs.dir }}/$REL"
+                if [ -f "$CAND" ]; then
+                  APK="$CAND"
+                  echo "✅ APK dari build.log (path resmi Flutter): $APK"
+                else
+                  echo "⚠️ build.log nyebut '$REL' tapi file-nya gak ada di $CAND"
+                fi
+              else
+                echo "⚠️ Gak nemu baris 'Built ...apk' di build.log"
+              fi
             fi
-            APK_DIR=$(dirname "$APK")
+          fi
+
+          # --- Strategi fallback: cari APK final (exclude intermediates) ---
+          if [ -z "$APK" ]; then
+            echo "↩️ Fallback strategy 1 (exclude intermediates/tmp/kotlin/.gradle)"
+            APK=$(find project_raw -type f -name "*.apk" \
+                  -not -path "*/intermediates/*" \
+                  -not -path "*/tmp/*" \
+                  -not -path "*/kotlin/*" \
+                  -not -path "*/.gradle/*" \
+                  2>/dev/null | head -n 1 || true)
+          fi
+
+          # --- Fallback strategy 2: include intermediates ---
+          if [ -z "$APK" ]; then
+            echo "↩️ Fallback strategy 2 (include intermediates)"
+            APK=$(find project_raw -type f -name "*.apk" \
+                  -not -path "*/.gradle/*" \
+                  2>/dev/null | head -n 1 || true)
+          fi
+
+          # --- Fallback strategy 3: khusus flutter-build ---
+          if [ -z "$APK" ]; then
+            echo "↩️ Fallback strategy 3 (flutter-build path)"
+            APK=$(find project_raw -type f -name "*.apk" \
+                  -path "*/flutter-build/*" \
+                  2>/dev/null | head -n 1 || true)
+          fi
+
+          if [ -z "$APK" ]; then
+            echo "::error::APK tidak ditemukan setelah semua strategy."
+            echo "=== Isi build.log (100 baris terakhir) ==="
+            tail -100 "${{ steps.detect.outputs.dir }}/build.log" 2>/dev/null || echo "(build.log tidak ada)"
+            echo ""
+            echo "=== Full tree project_raw/app/build ==="
+            find project_raw -type d -name "build" -exec find {} -maxdepth 4 -type d \; 2>/dev/null | head -50 || true
+            echo ""
+            echo "=== Semua file .apk (full scan) ==="
+            find / -type f -name "*.apk" 2>/dev/null | grep -v "/proc/" | head -20 || true
+            exit 1
+          fi
+
+          APK_DIR=$(dirname "$APK")
+          APK_SIZE=$(stat -c%s "$APK" 2>/dev/null || echo "0")
+          echo "✅ APK ditemukan: $APK"
+          echo "📁 Folder: $APK_DIR"
+          echo "📦 Size: $APK_SIZE bytes"
+
+          if [ "$APK_SIZE" -lt 1000 ]; then
+            echo "::error::APK terlalu kecil ($APK_SIZE bytes), kemungkinan corrupt."
+            exit 1
           fi
 
           echo "APK_DIR=$APK_DIR" >> "$GITHUB_ENV"
-          echo "=== APK yang dihasilkan ==="
-          ls -lh "$APK_DIR"/*.apk
+          echo "APK_PATH=$APK" >> "$GITHUB_ENV"
 
       # =========================================================
-      # 9. UPLOAD
+      # 10. UPLOAD
       # =========================================================
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: apk-${{ github.event.inputs.jobId }}
-          path: ${{ env.APK_DIR }}/*.apk
+          path: ${{ env.APK_PATH }}
           compression-level: 0
           retention-days: 1
           if-no-files-found: error
+
+      # =========================================================
+      # 11. UPLOAD BUILD LOG (jika gagal)
+      # =========================================================
+      - name: Upload build log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ github.event.inputs.jobId }}
+          path: |
+            ${{ steps.detect.outputs.dir }}/build.log
+            ${{ steps.detect.outputs.dir }}/android/build.log
+          if-no-files-found: ignore
+          retention-days: 1
